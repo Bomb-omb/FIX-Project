@@ -1,0 +1,18 @@
+# Conda virtual environments
+env/
+venv/
+*.conda
+*.log
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+__pycache__/
+
+# Conda environment files (lock files can be ignored)
+environment.yml.lock
+
+# System-specific files
+.DS_Store
+Thumbs.db
