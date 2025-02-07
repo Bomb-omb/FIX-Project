@@ -11,12 +11,19 @@ import time
 from datetime import datetime
 import asyncio
 
+# Set up logging
+logging.basicConfig(
+    filename="log/fix_client.log",  # Check if this is pointing to the right file
+    level=logging.DEBUG,  # Make sure logging captures DEBUG messages
+    format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+logger = logging.getLogger(__name__)
+
 class Application(fix.Application):
     def __init__(self, settings):
-        super(Application, self).__init__()
-        self.logger  = logging.getLogger(self.__class__.__name__)
+        super().__init__()
         self.sessionID = None
-        self.connected = False
         self.session_settings = settings
         self._client_str = "CLIENT"
         self._server_str = "SERVER"
@@ -24,13 +31,11 @@ class Application(fix.Application):
     def onCreate(self, sessionID):
         self.sessionID = sessionID
         self.logger = logging.getLogger(f"{self.__class__.__name__}.{sessionID.toString()}")
-        self.logger.info(f"Session created: {sessionID}")
     
     def onLogon(self, sessionID):
         self.logger.info(f"Logon: {sessionID}")
         self.connected = True
         self.sessionID = sessionID
-        print(f"Logon: {sessionID}")
     
     def onLogout(self, sessionID):
         self.logger.info(f"Logout: {sessionID}")
@@ -56,34 +61,32 @@ class Application(fix.Application):
     
     def fromApp(self, message, sessionID):
         self.logger.info(f"{self._server_str} {sessionID} {message}")
-        print(f"{self._server_str} {sessionID} {message}")
-        print(f"Received message: {message}")
         
-        msgType = message.getHeader().getField(fix.MsgType().getField())
-        #message.getHeader().getField(msgType)
+        msgType = fix.MsgType()
+        message.getHeader().getField(msgType)
+        message_type_value = msgType.getValue()
 
-        if msgType == fix.MsgType_ExecutionReport:
-            print(f"Execution report received: {message}")
-            order_id = message.getField(fix.ClOrdID())
-            exec_type = message.getField(fix.ExecType())
+        raw_fix_msg = message.toString().replace("\x01", "|")
+        logger.info(f"Received Message: {raw_fix_msg}")
 
-            # for tag 6 avg_px
-            if not message.isSetField(fix.AvgPx()):
-                avg_px = "0.0"  # Default if missing
-                message.setField(fix.AvgPx(avg_px))
-            else:
+        if message_type_value == fix.MsgType_Heartbeat:
+            logger.info("Heartbeat received.")
+
+        if msgType.getValue() == fix.MsgType_ExecutionReport:
+            logger.info(f"Execution Report received: {message}")
+            
+            if message.isSetField(fix.AvgPx()):
                 avg_px = message.getField(fix.AvgPx())
-            print(f"Execution Report: Order {order_id} Status {exec_type} Average price: {avg_px}")
-                
-        elif msgType.getValue() == fix.MsgType_OrderCancelReject:
-            print(f"Order cancel reject received: {message}")
-        elif msgType.getValue() == fix.MsgType_Reject:
-            print(f"Reject received: {message}")
-        else:
-            print(f"{message}")
+                logger.info(f"Average price: {avg_px}")
+            else:
+                logger.error("Average price not found in execution report")
 
-    def getSettings(self):
-        return self.session_settings
+        elif msgType.getValue() == fix.MsgType_OrderCancelReject:
+            logger.error(f"Order Cancel Reject received: {message}")
+        elif msgType.getValue() == fix.MsgType_Reject:
+            logger.warning(f"Reject received: {message}")
+        else:
+            logger.debug(f"Received message: {message_type_value} {message}")
 
     def orderGeneratorandSender(self):
         if self.sessionID is None:
@@ -129,24 +132,21 @@ class Application(fix.Application):
         message.setField(fix.HandlInst("1")) # Automated execution order
         message.setField(fix.TransactTime())
         message.setField(fix.ExecInst("0"))  # Default execution instruction
-        # message.setField(fix.AvgPx(0))  # Average price
-        # message.setField(fix.TransactTime(fix.UtcTimeStamp()))
-
 
         if price:
             message.setField(fix.Price(price))
 
         try:
             fix.Session.sendToTarget(message, self.sessionID)
-            print(f"Sent {SIDE_MAP.get(side, side)} order for {quantity} {ticker} at {price if price else 'market'}")
+            logger.info(f"Sent {SIDE_MAP.get(side, side)} order for {quantity} {ticker} at {price if price else 'market'})")
             return order_id
         except fix.SessionNotFound:
-            print("Session not found")
+            logger.error("Session not found")
             return
 
     def cancelOrder(self, order_id):
         if self.sessionID is None:
-            print("No session ID found")
+            logger.error("No session ID found")
             return
         
         message = fix42.OrderCancelRequest()
@@ -171,10 +171,10 @@ class Application(fix.Application):
 
         try:
             fix.Session.sendToTarget(message, self.sessionID)
-            print(f"Sent cancel order for {order_id}")
+            logger.info(f"Cancel order sent for {order_id}")
             
         except fix.SessionNotFound:
-            print("Session not found")
+            logger.error("Session not found")
 
     def sendOrderWindow(self):
         start_time = time.time()
@@ -183,8 +183,8 @@ class Application(fix.Application):
 
         try:
             while time.time() - start_time < 300: # 5-minute window
-                if order_count >= 50:
-                    print(f"Order limit reached: {order_count}")
+                if order_count >= 25:
+                    logger.info(f"Order limit reached: {order_count}")
                     break
 
                 order_id = self.orderGeneratorandSender()
@@ -192,15 +192,14 @@ class Application(fix.Application):
                     orders.append(order_id) # track order IDs
                     order_count += 1
 
-                if random.random() < 0.1 and orders and order_count < 50: 
+                if random.random() < 0.1 and orders and order_count < 25: 
                     cancel_id = random.choice(orders)
                     self.cancelOrder(order_id=cancel_id)
                     orders.remove(cancel_id)
-                    order_count += 1 # might remove counting cancel as an order
 
                 time.sleep(0.1)
         except Exception as e:
-            print(f"Error: {e}")
+            logger.error(f"Error: {e}")
 
     # async methods for sending orders and cancelling orders concurrently
     """async def asyncOrderSender(self, orders):
