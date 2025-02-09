@@ -1,0 +1,8 @@
+
+============ MARKET STATS ============
+VWAP for MSFT: 199.98999 USD
+VWAP for AAPL: 153.72405 USD
+VWAP for BAC: 57.45978 USD
+Total Volume: 1060707.22631 USD
+PnL: 292326.95559 USD
+======================================

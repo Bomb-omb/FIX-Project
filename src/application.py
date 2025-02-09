@@ -22,9 +22,11 @@ class Application(fix.Application):
         self.open_orders = {}
         self.sessionID = None
         self.order_book = {}
-        self.vwap_data = {"MSFT": {"total_value": 0, "total_qty": 0},
-                          "AAPL": {"total_value": 0, "total_qty": 0},
-                          "BAC": {"total_value": 0, "total_qty": 0}}
+        self.portfolio = {}
+        self.total_volume = 0.0
+        self.vwap_data = {"MSFT": {"priceXvol": 0.0, "total_qty": 0, "vwap": 0.0},
+                          "AAPL": {"priceXvol": 0.0, "total_qty": 0, "vwap": 0.0},
+                          "BAC": {"priceXvol": 0.0, "total_qty": 0, "vwap": 0.0}}
 
     def onCreate(self, sessionID):
         sessionID = sessionID
@@ -77,8 +79,7 @@ class Application(fix.Application):
         
         missing_fields = [name for name in required_fields if not message.isSetField(name)]
         if missing_fields:
-            logger.error(f"Missing fields in message: {missing_fields}")
-            print(f"Missing fields in message: {missing_fields}")
+            self.log_missing_fields(message, missing_fields)
             return
 
         elif msgType == fix.MsgType_OrderCancelReject:
@@ -87,19 +88,40 @@ class Application(fix.Application):
         return
 
     def onMessage(self, message, sessionID):
-        """Processing application message here"""
         pass
 
     def genClOrdID(self):
-        """Generate ClOrdID"""
-        """self.ClOrdID += 1
-        return str(self.ClOrdID).zfill(5)"""
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
         return timestamp
+    
+    def log_missing_fields(self, message, required_fields):
+        FIX_FIELD_NAMES = {
+            6: "AvgPx",
+            14: "CumQty",
+            38: "OrderQty",
+            40: "OrdType",
+            44: "Price",
+            151: "LeavesQty"
+        }
+
+        field_info = []
+        for field in required_fields:
+            try:
+                #get the tag and name of the field
+                tag = field.getTag()
+                name = FIX_FIELD_NAMES.get(tag, "Unknown")
+                field_info.append(f"{tag}={name}")
+            except Exception as e:
+                logger.error(f"Error in extracting field info: {e}")
+                print(f"Error in extracting field info: {e}")
+        
+        missing_fields = ", ".join(field_info)
+        logger.warning(f"Missing fields in message: {missing_fields}")
     
     def parse_ExecutionReport(self, message, sessionID):
         raw_message = message.toString().replace(__SOH__, "|")
         print(f"Debug: {raw_message}")
+
         exec_type = extract_message_field_value(fix.ExecType(), message, 'str')
         cl_ord_id = extract_message_field_value(fix.ClOrdID(), message, 'str')
         order_id = extract_message_field_value(fix.OrderID(), message, 'str')
@@ -111,10 +133,28 @@ class Application(fix.Application):
         OrdType = extract_message_field_value(fix.OrdType(), message, 'str')
         MinQty = extract_message_field_value(fix.MinQty(), message, 'int')
 
-        last_px = extract_message_field_value(fix.LastPx(), message, 'float')
+        last_px = extract_message_field_value(fix.LastPx(), message, 'float') or 0.0
         last_qty = extract_message_field_value(fix.LastQty(), message, 'int')
+        exec_qty = extract_message_field_value(fix.LastShares(), message, 'int') or 0
 
-        prev_cum_qty = self.order_book.get(cl_ord_id, {}).get("cum_qty", 0)
+        if not symbol:
+            return
+
+        if symbol not in self.portfolio:
+            self.portfolio[symbol] = {"position": 0, "avg_price": 0.0, "PnL": 0.0, "unrealised_PnL": 0.0}
+
+        if symbol not in self.vwap_data:
+            self.vwap_data[symbol] = {"priceXvol": 0.0, "total_qty": 0, "vwap": 0.0}
+
+        if ord_status in [fix.OrdStatus_FILLED, fix.OrdStatus_PARTIALLY_FILLED]:
+            if exec_type == fix.ExecType_FILL:
+                self.portfolio[symbol]["position"] += exec_qty if side == fix.Side_BUY else -exec_qty
+                self.portfolio[symbol]["avg_price"] = (self.portfolio[symbol]["avg_price"] + last_px) / self.portfolio[symbol]["position"]
+                if side == fix.Side_SELL:
+                    self.portfolio[symbol]["PnL"] += (last_px - price) * exec_qty
+                self.portfolio[symbol]["unrealised_PnL"] = (last_px - self.portfolio[symbol]["avg_price"]) * self.portfolio[symbol]["position"]
+
+        prev_cum_qty = self.order_book.get(cl_ord_id, {}).get("cum_qty", 0) or 0
 
         if last_px is not None and last_qty is not None:
             cum_qty = prev_cum_qty + last_qty
@@ -144,14 +184,14 @@ class Application(fix.Application):
         
         if ord_status in [fix.OrdStatus_CANCELED, fix.OrdStatus_REJECTED]:
             if cl_ord_id in self.open_orders:
-                self.open_orders.remove(cl_ord_id)
+                del self.open_orders[cl_ord_id]
             if cl_ord_id in self.order_book:
                 del self.order_book[cl_ord_id]
             print(f"Order Cancelled/Rejected: ClOrdID={cl_ord_id}, Symbol={symbol}, Side={side}")
             return
 
         if exec_type == fix.ExecType_PARTIAL_FILL:
-            self.order_book[order_id] = {"symbol": symbol,
+            self.order_book[cl_ord_id] = {"symbol": symbol,
                 "side": side,
                 "order_qty": order_qty,
                 "price": price,
@@ -160,8 +200,16 @@ class Application(fix.Application):
                 "avg_px": avg_px
             }
 
+            self.total_volume += last_px * exec_qty
+
+            self.portfolio[cl_ord_id] = {"symbol": symbol, "side": side, "order_qty": order_qty, "price": price, "PnL": 0}
+
+            self.vwap_data[symbol]["priceXvol"] += last_px * exec_qty
+            self.vwap_data[symbol]["total_qty"] += exec_qty
+            self.vwap_data[symbol]["vwap"] = self.vwap_data[symbol]["priceXvol"] / self.vwap_data[symbol]["total_qty"] if self.vwap_data[symbol]["total_qty"] > 0 else 0.0
+
         if exec_type == fix.ExecType_FILL:
-            self.order_book[order_id] = {"symbol": symbol,
+            self.order_book[cl_ord_id] = {"symbol": symbol,
                 "side": side,
                 "order_qty": order_qty,
                 "price": price,
@@ -169,10 +217,28 @@ class Application(fix.Application):
                 "leaves_qty": leaves_qty,
                 "avg_px": avg_px
             }
+
+            self.vwap_data[symbol]["priceXvol"] += last_px * exec_qty
+            self.vwap_data[symbol]["total_qty"] += exec_qty
+            self.vwap_data[symbol]["vwap"] = self.vwap_data[symbol]["priceXvol"] / self.vwap_data[symbol]["total_qty"] if self.vwap_data[symbol]["total_qty"] > 0 else 0.0
+
+            self.total_volume += last_px * exec_qty
+
             if cl_ord_id in self.open_orders:
-                self.open_orders.remove(cl_ord_id)
+                del self.open_orders[cl_ord_id]
+
+            self.portfolio[cl_ord_id] = {"symbol": symbol, "side": side, "order_qty": order_qty, "price": price}
                 
-        self.compute_stats()
+        self.pnl = sum(self.portfolio[symbol].get("PnL", 0.0) for symbol in self.portfolio)
+        
+        print("\n============ MARKET STATS ============")
+        for symbol, data in self.vwap_data.items():
+            print(f"VWAP for {symbol}: {round(data['vwap'], 5)} USD")
+        print(f"Total Volume: {round(self.total_volume, 5)} USD")
+        print(f"PnL: {round(self.pnl, 5)} USD")
+        print("======================================\n")
+
+        self.save_market_stats()
 
         if exec_type == fix.ExecType_NEW:
             logger.info(f"New Order: ClOrdID={cl_ord_id}, OrderID={order_id}, Symbol={symbol}, Side={side}, OrderQty={order_qty}, Price={price}")
@@ -187,21 +253,39 @@ class Application(fix.Application):
         else:
             logger.error(f"Unknown Execution Type: {exec_type}")
 
-        print("\n===== ORDER BOOK UPDATE =====")
-        for clordid, order in self.order_book.items():
-            print(f"ClOrdID: {clordid}, Order: {order}")
-        print("================================\n")
+    def save_market_stats(self):
+        with open("market_stats.txt", "w") as f:
+            f.write("\n============ MARKET STATS ============\n")
+            for symbol, data in self.vwap_data.items():
+                f.write(f"VWAP for {symbol}: {round(data['vwap'], 5)} USD\n")
+            f.write(f"Total Volume: {round(self.total_volume, 5)} USD\n")
+            f.write(f"PnL: {round(self.pnl, 5)} USD\n")
+            f.write("======================================\n")
 
-        print("\n===== OPEN ORDERS =====")
-        print(self.open_orders)
-        print("========================\n")
+        print("Market stats saved to market_stats.txt")
 
     def new_order(self):
         symbols = ["MSFT", "AAPL", "BAC"]
-        sides = [fix.Side_BUY, fix.Side_SELL]
         ord_types = [fix.OrdType_LIMIT, fix.OrdType_MARKET]
 
         ord_type = random.choice(ord_types)
+        symbol = random.choice(symbols)
+        order_qty = random.randint(1,100)
+        price = random.uniform(100,200) if ord_type == fix.OrdType_LIMIT else None
+
+        if symbol in self.portfolio and self.portfolio[symbol]["position"] > 0:
+            sides = [fix.Side_SELL, fix.Side_BUY]
+        else:
+            sides = [fix.Side_BUY, fix.Side_SELL_SHORT]
+
+        side = random.choice(sides)
+
+        if side == fix.Side_SELL and symbol in self.portfolio:
+            max_sell_qty = self.portfolio[symbol]["position"]
+            if max_sell_qty > 0:
+                order_qty = random.randint(1, max_sell_qty)
+            else:
+                print(f"Cannot sell {symbol} as position is 0")
 
         message = fix.Message()
         header = message.getHeader()
@@ -210,12 +294,12 @@ class Application(fix.Application):
 
         ClOrdID = self.genClOrdID()
         message.setField(fix.ClOrdID(ClOrdID)) 
-        message.setField(fix.Side(random.choice(sides))) 
-        message.setField(fix.Symbol(random.choice(symbols))) 
-        message.setField(fix.OrderQty(random.randint(1,100)))
+        message.setField(fix.Side(side)) 
+        message.setField(fix.Symbol(symbol)) 
+        message.setField(fix.OrderQty(order_qty))
         message.setField(fix.OrdType(ord_type))
         if ord_type == fix.OrdType_LIMIT:
-            message.setField(fix.Price(random.uniform(100,200)))
+            message.setField(fix.Price(price))
         message.setField(fix.HandlInst("1"))
         message.setField(fix.TimeInForce('0'))
         message.setField(fix.Text("NewOrderSingle"))
@@ -229,13 +313,13 @@ class Application(fix.Application):
         fix.Session.sendToTarget(message, self.sessionID)
 
         # Add details to open orders
-        self.order_book[ClOrdID] = {"symbol": message.getField(fix.Symbol()).getString(),
-                                    "side": message.getField(fix.Side()).getString(),
-                                    "order_qty": int(message.getField(fix.OrderQty()).getString()),
-                                    "price": float(message.getField(fix.Price()).getString()) if ord_type == fix.OrdType_LIMIT else None,
+        self.order_book[ClOrdID] = {"symbol": symbol,
+                                    "side": side,
+                                    "order_qty": order_qty,
+                                    "price": price if ord_type == fix.OrdType_LIMIT else None,
                                     "cum_qty": 0,
-                                    "leaves_qty": int(message.getField(fix.OrderQty()).getString()),
-                                    "avg_px": 0
+                                    "leaves_qty": order_qty,
+                                    "avg_px": 0.0
                                     }
         
         self.open_orders[ClOrdID] = self.order_book[ClOrdID].copy()
@@ -247,9 +331,12 @@ class Application(fix.Application):
             return
 
         original_order = self.open_orders[ClOrdID]
-        symbol = original_order.get("symbol")
-        side = original_order.get("side")
-        order_qty = original_order.get("order_qty")
+        symbol = original_order["symbol"]
+        side = original_order["side"]
+
+        if not symbol or not side:
+            print(f"Invalid order details for ClOrdID: {ClOrdID}")
+            return
 
         message = fix.Message()
         header = message.getHeader()
@@ -260,7 +347,14 @@ class Application(fix.Application):
         message.setField(fix.OrigClOrdID(ClOrdID))
         message.setField(fix.Symbol(symbol))
         message.setField(fix.Side(side))
-        message.setField(fix.OrderQty(order_qty))
+        message.setField(fix.Text("OrderCancelRequest"))
+        trstime = fix.TransactTime()
+        trstime.setString(datetime.now().strftime("%Y%m%d-%H:%M:%S.%f")[:-3])
+        message.setField(trstime)
+        message.setField(fix.CxlRejResponseTo("1"))
+
+        raw_msg = message.toString().replace(__SOH__, "|")
+        logger.info(f"DEBUG: Sending Order Cancel Request -> {raw_msg}")
 
         fix.Session.sendToTarget(message, self.sessionID)
 
@@ -276,7 +370,7 @@ class Application(fix.Application):
 
         try:
             while time.time() - start_time < 300:
-                if order_count == 25:
+                if order_count == 1000:
                     logger.info("Order count reached, stopping order window")
                     break
 
@@ -285,7 +379,7 @@ class Application(fix.Application):
                 order_count += 1
 
                 if random.random() < 0.1 and self.open_orders:
-                    cancel_ID = random.choice(self.open_orders)
+                    cancel_ID = random.choice(list(self.open_orders.keys()))
                     self.order_cancel(cancel_ID)
                     
                 time.sleep(0.1)
@@ -295,26 +389,6 @@ class Application(fix.Application):
         except Exception as e:
             logger.error("Error in order window: %s" % e)
             return
-        
-    def compute_stats(self):
-        self.total_volume =sum((order["cum_qty"] or 0) * (order["avg_px"] or 0) for order in self.order_book.values())
-
-        #PnL calculation
-        self.pnl = sum((order["cum_qty"] or 0) * ((order["avg_px"] or 0) - (order["price"] or 0)) for order in self.order_book.values())
-
-        #VWAP calculation
-        for symbol in ["MSFT", "AAPL", "BAC"]:
-            total_value = sum((order["cum_qty"] or 0) * (order["avg_px"] or 0) for order in self.order_book.values() if order["symbol"] == symbol)
-            total_qty = sum((order["cum_qty"] or 0) for order in self.order_book.values() if order["symbol"] == symbol)
-            self.vwap_data[symbol]["total_value"] = total_value
-            self.vwap_data[symbol]["total_qty"] = total_qty
-
-            # Fix division by zero error
-            vwap = total_value/total_qty if total_qty > 0 else 0
-            print(f"VWAP for {symbol}: {round(vwap, 5)} USD")
-
-        print(f"Total Volume: {round(self.total_volume, 5)} USD")
-        print(f"PnL: {round(self.pnl, 5)} USD")
     
 def main(config_file):
     try:
